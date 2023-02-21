@@ -1,146 +1,84 @@
-import { BinarySensor, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceDiscovery, DeviceProvider, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceProperty, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
+import { Device, DeviceProvider, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue} from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
-import { StorageSettings } from "@scrypted/sdk/storage-settings"
-import fs from 'fs';
-import path from 'path';
+import { StorageSettings } from '@scrypted/sdk/storage-settings';
+import { connectScryptedClient, ScryptedClientStatic } from '@scrypted/client';
+import https from 'https';
 
-const { log, deviceManager, mediaManager } = sdk;
+const { deviceManager } = sdk;
 
-// use the dog.jpg from the fs directory that will be packaged with the plugin
-const dogImage = fs.readFileSync('dog.jpg');
+class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider, Settings {
+    client: ScryptedClientStatic = null;
 
-class SampleCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor {
-    constructor(public plugin: SampleCameraPlugin, nativeId: string) {
-        super(nativeId);
-    }
-
-    async takePicture(options?: PictureOptions): Promise<MediaObject> {
-        return mediaManager.createMediaObject(dogImage, 'image/jpeg');
-    }
-
-    async getPictureOptions(): Promise<PictureOptions[]> {
-        // can optionally provide the different resolutions of images that are available.
-        // used by homekit, if available.
-        return;
-    }
-
-    async getVideoStream(options?: MediaStreamOptions): Promise<MediaObject> {
-        let ffmpegInput: FFmpegInput;
-
-        const file = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'zip', 'unzipped', 'fs', 'dog.mp4');
-
-        ffmpegInput = {
-            // the input doesn't HAVE to be an url, but if it is, provide this hint.
-            url: undefined,
-            inputArguments: [
-                '-re',
-                '-stream_loop', '-1',
-                '-i', file,
-            ]
-        };
-
-        return mediaManager.createMediaObject(Buffer.from(JSON.stringify(ffmpegInput)), ScryptedMimeTypes.FFmpegInput);
-    }
-
-    async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
-        return [{
-            id: 'stream',
-            audio: null,
-            video: {
-                codec: 'h264',
-            }
-        }];
-    }
-
-
-    async startIntercom(media: MediaObject): Promise<void> {
-        const ffmpegInput: FFmpegInput = JSON.parse((await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput)).toString());
-        // something wants to start playback on the camera speaker.
-        // use their ffmpeg input arguments to spawn ffmpeg to do playback.
-        // some implementations read the data from an ffmpeg pipe output and POST to a url (like unifi/amcrest).
-        throw new Error('not implemented');
-    }
-
-    async stopIntercom(): Promise<void> {
-    }
-
-    // most cameras have have motion and doorbell press events, but dont notify when the event ends.
-    // so set a timeout ourselves to reset the state.
-    triggerBinaryState() {
-        this.binaryState = true;
-        setTimeout(() => this.binaryState = false, 10000);
-    }
-
-    // most cameras have have motion and doorbell press events, but dont notify when the event ends.
-    // so set a timeout ourselves to reset the state.
-    triggerMotion() {
-        this.motionDetected = true;
-        setTimeout(() => this.motionDetected = false, 10000);
-    }
-}
-
-class SampleCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceDiscovery, Settings, DeviceCreator {
-    devices = new Map<string, SampleCameraDevice>();
+    devices = new Map<string, ScryptedDevice>();
 
     settingsStorage = new StorageSettings(this, {
-        email: {
-            title: 'Email',
-            onPut: async () => this.clearTryDiscoverDevices(),
+        baseUrl: {
+            title: 'Base URL',
+            placeholder: 'https://localhost:10443',
+            onPut: async () => await this.clearTryDiscoverDevices(),
+        },
+        username: {
+            title: 'Username',
+            onPut: async () => await this.clearTryDiscoverDevices(),
         },
         password: {
             title: 'Password',
             type: 'password',
-            onPut: async () => this.clearTryDiscoverDevices(),
-        },
-        twoFactorCode: {
-            title: 'Two Factor Code',
-            description: 'Optional: If 2 factor is enabled on your account, enter the code sent to your email or phone number.',
-            onPut: async (oldValue, newValue) => {
-                await this.tryLogin(newValue);
-                await this.discoverDevices(0);
-            },
-            noStore: true,
+            onPut: async () => await this.clearTryDiscoverDevices(),
         },
     });
 
     constructor() {
         super();
-        this.discoverDevices(0);
+        this.clearTryDiscoverDevices();
     }
 
-    async getCreateDeviceSettings(): Promise<Setting[]> {
-        return [
-            {
-                key: 'name',
-                title: 'Name',
-            }
+    /**
+     * Checks the given remote device to see if it can be correctly imported by this plugin.
+     * Returns the (potentially modified) device that is allowed, or null if the device cannot
+     * be imported.
+     */
+    allowlisted(device: Device): Device {
+        // only permit the following interfaces through
+        const allowedInterfaces = [
+            ScryptedInterface.VideoCamera,
+            ScryptedInterface.Camera,
+            ScryptedInterface.RTCSignalingChannel,
         ];
+        const intersection = allowedInterfaces.filter(i => device.interfaces.includes(i));
+        if (intersection.length == 0) {
+            return null;
+        }
+        device.interfaces = intersection;
+
+        return device;
     }
 
-    async createDevice(settings: DeviceCreatorSettings): Promise<string> {
-        const nativeId = Math.random().toString();
-        await deviceManager.onDeviceDiscovered({
-            nativeId,
-            type: ScryptedDeviceType.Camera,
-            interfaces: [
-                ScryptedInterface.VideoCamera,
-                ScryptedInterface.Camera,
-            ],
-            name: settings.name?.toString(),
+    async clearTryDiscoverDevices(): Promise<void> {
+        await this.tryLogin();
+        await this.discoverDevices(0);
+    }
+
+    async tryLogin(): Promise<void> {
+        this.client = null;
+
+        if (!this.settingsStorage.values.baseUrl || !this.settingsStorage.values.username || !this.settingsStorage.values.password) {
+            throw new Error("Initializing remote Scrypted login requires the base URL, username, and password");
+        }
+
+        const httpsAgent = new https.Agent({
+            rejectUnauthorized: false,
         });
-        return nativeId;
-    }
-
-    clearTryDiscoverDevices() {
-        // add code to clear any refresh tokens, etc, here. login changed.
-
-        this.discoverDevices(0);
-    }
-
-    async tryLogin(twoFactorCode?: string) {
-        // this shows a user alert in the ui
-        // this.log.a('Login failed! Is your username correct?');
-        // throw new Error('login failed');
+        this.client = await connectScryptedClient({
+            baseUrl: this.settingsStorage.values.baseUrl,
+            pluginId: '@scrypted/core',
+            username: this.settingsStorage.values.username,
+            password: this.settingsStorage.values.password,
+            axiosConfig: {
+                httpsAgent,
+            },
+        })
+        this.console.log(`Connected to remote Scrypted server. Remote server version: ${this.client.serverVersion}`)
     }
 
     getSettings(): Promise<Setting[]> {
@@ -151,63 +89,56 @@ class SampleCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, D
         return this.settingsStorage.putSetting(key, value);
     }
 
-    async discoverDevices(duration: number) {
-        await this.tryLogin();
-        // add code to retrieve the list of cameras.
-        const devices: Device[] = [];
-        for (const camera of ['camera 1', 'camera 2']) {
-            const nativeId = camera;
-            const interfaces = [
-                ScryptedInterface.Camera,
-                ScryptedInterface.VideoCamera,
-                ScryptedInterface.MotionSensor,
-            ];
-            // if (camera.isDoorbell) {
-            //     interfaces.push(
-            //         ScryptedInterface.BinarySensor,
-            //         ScryptedInterface.Intercom
-            //     );
-            // }
-            const device: Device = {
-                info: {
-                    model: 'Doggy Cam',
-                    manufacturer: 'Sample Camera Manufacturer',
-                },
-                nativeId,
-                name: camera,
-                // type: camera.isDoorbell ? ScryptedDeviceType.Doorbell : ScryptedDeviceType.Camera,
-                type: ScryptedDeviceType.Camera,
-                interfaces,
-            };
-            devices.push(device);
+    async discoverDevices(duration: number): Promise<void> {
+        if (!this.client) {
+            return
+        }
 
-            // sample code to listen and report doorbell/motion events.
-            // varies by api
-            // camera.on('doorbell', () => {
-            //     const camera = this.devices.get(nativeId);
-            //     camera?.triggerBinaryState();
-            // });
-            // sample code to listen and report doorbell/motion events.
-            // varies by api
-            // camera.on('motion', () => {
-            //     const camera = this.devices.get(nativeId);
-            //     camera?.triggerMotion();
-            // });
+        const state = this.client.systemManager.getSystemState();
+        const devices = <Device[]>[];
+        for (const id in state) {
+            const remoteDevice = this.client.systemManager.getDeviceById(id);
+            try {
+                // test access
+                remoteDevice.nativeId;
+            } catch {
+                this.console.log(`Cannot access remote device ${id}, ignoring`);
+                continue;
+            }
+
+            const device = this.allowlisted(<Device>{
+                name: remoteDevice.name,
+                type: remoteDevice.type,
+                interfaces: remoteDevice.interfaces,
+                info: remoteDevice.info,
+                nativeId: remoteDevice.id,
+            });
+            if (!device) {
+                this.console.log(`Device ${remoteDevice.name} is not supported, ignoring`)
+                continue;
+            }
+
+            this.console.log(`Found ${remoteDevice.name}\n${JSON.stringify(device, null, 2)}`);
+            this.devices.set(device.nativeId, remoteDevice);
+            devices.push(device)
         }
 
         await deviceManager.onDevicesChanged({
             devices,
         });
-        this.console.log('discovered devices');
+        this.console.log(`Discovered ${devices.length} devices`);
     }
 
-    getDevice(nativeId: string) {
+    async getDevice(nativeId: string): Promise<Device> {
         if (!this.devices.has(nativeId)) {
-            const camera = new SampleCameraDevice(this, nativeId);
-            this.devices.set(nativeId, camera);
+            throw new Error(`${nativeId} does not exist`)
         }
-        return this.devices.get(nativeId);
+        return <Device>this.devices.get(nativeId);
+    }
+
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
+        this.devices.delete(nativeId)
     }
 }
 
-export default new SampleCameraPlugin();
+export default new ScryptedRemotePlugin();

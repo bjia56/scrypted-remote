@@ -1,6 +1,7 @@
 {
-   "name": "@scrypted/sample-cameraprovider",
-   "private": true,
+   "name": "@scrypted/scrypted-remote",
+   "version": "0.0.1",
+   "description": "Scrypted Remote Plugin",
    "scripts": {
       "scrypted-setup-project": "scrypted-setup-project",
       "prescrypted-setup-project": "scrypted-package-json",
@@ -17,23 +18,21 @@
    "keywords": [
       "scrypted",
       "plugin",
-      "Camera Manufacturer Name"
+      "remote"
    ],
    "scrypted": {
-      "name": "Sample Camera Provider Plugin",
+      "name": "Scrypted Remote Plugin",
       "type": "DeviceProvider",
       "interfaces": [
-         "DeviceCreator",
-         "DeviceDiscovery",
          "DeviceProvider",
          "Settings"
       ]
    },
    "dependencies": {
-      "@types/node": "^16.6.1"
+      "@scrypted/client": "^1.1.37"
    },
    "devDependencies": {
-      "@scrypted/sdk": "^0.1.3"
-   },
-   "version": "0.0.7"
+      "@scrypted/sdk": "^0.2.63",
+      "@types/node": "^17.0.24"
+   }
 }
