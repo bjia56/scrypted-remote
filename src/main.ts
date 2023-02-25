@@ -1,8 +1,9 @@
-import { Device, DeviceProvider, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, Battery, VideoCamera, SettingValue, RequestMediaStreamOptions, MediaObject} from '@scrypted/sdk';
+import { Device, DeviceProvider, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, Battery, VideoCamera, SettingValue, RequestMediaStreamOptions, MediaObject, DeviceManifest} from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { connectScryptedClient, ScryptedClientStatic } from '@scrypted/client';
 import https from 'https';
+import { stringify } from 'querystring';
 
 const { deviceManager } = sdk;
 
@@ -37,15 +38,29 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
      * Checks the given remote device to see if it can be correctly imported by this plugin.
      * Returns the (potentially modified) device that is allowed, or null if the device cannot
      * be imported.
+     *
+     * @param device
+     * The local device representation. Will be modified in-place and returned.
      */
     filtered(device: Device): Device {
+        // only permit the following device types through
+        const allowedTypes = [
+            ScryptedDeviceType.Camera,
+            ScryptedDeviceType.DeviceProvider,
+        ]
+        if (!allowedTypes.includes(device.type)) {
+            return null;
+        }
+
         // only permit the following interfaces through
         const allowedInterfaces = [
+            ScryptedInterface.Readme,
             ScryptedInterface.VideoCamera,
             ScryptedInterface.Camera,
             ScryptedInterface.RTCSignalingChannel,
             ScryptedInterface.Battery,
             ScryptedInterface.MotionSensor,
+            ScryptedInterface.DeviceProvider,
         ];
         const intersection = allowedInterfaces.filter(i => device.interfaces.includes(i));
         if (intersection.length == 0) {
@@ -56,6 +71,17 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
         return device;
     }
 
+    /**
+     * Configures relevant proxies for the local device representation and the remote device.
+     * Listeners are added for interface property updates, and select remote function calls are
+     * intercepted to tweak arguments for better remote integration.
+     *
+     * @param device
+     * The local device representation.
+     *
+     * @param remoteDevice
+     * The RPC reference to the remote device.
+     */
     setupProxies(device: Device, remoteDevice: ScryptedDevice) {
         // set up event listeners for all the relevant interfaces
         device.interfaces.map(iface => remoteDevice.listen(iface, (source, details, data) => {
@@ -67,13 +93,13 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
         }));
 
         // for certain interfaces with fixed state, transfer the initial values over
-        if (device.interfaces.indexOf(ScryptedInterface.Battery) != -1) {
+        if (device.interfaces.includes(ScryptedInterface.Battery)) {
             deviceManager.getDeviceState(device.nativeId).batteryLevel = (<Battery>remoteDevice).batteryLevel;
         }
 
         // since the remote may be using rebroadcast, explicitly request the external
-        // address here
-        if (device.interfaces.indexOf(ScryptedInterface.VideoCamera) != -1) {
+        // address for video streams
+        if (device.interfaces.includes(ScryptedInterface.VideoCamera)) {
             const remoteGetVideoStream = (<VideoCamera><any>remoteDevice).getVideoStream;
             async function newGetVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
                 if (!options) {
@@ -84,10 +110,32 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
             }
             (<VideoCamera><any>remoteDevice).getVideoStream = newGetVideoStream;
         }
+
+        // for device providers, we need to translate the nativeId
+        if (device.interfaces.includes(ScryptedInterface.DeviceProvider)) {
+            const plugin = this;
+            async function newGetDevice(nativeId: string): Promise<Device> {
+                return <Device>plugin.devices.get(nativeId);
+            }
+            async function newReleaseDevice(id: string, nativeId: string): Promise<any> {
+                // don't delete the device from the remote
+                plugin.releaseDevice(id, nativeId);
+            }
+            (<DeviceProvider><any>remoteDevice).getDevice = newGetDevice;
+            (<DeviceProvider><any>remoteDevice).releaseDevice = newReleaseDevice;
+        }
     }
 
+    /**
+     * Resets the connection to the remote Scrypted server and attempts to reconnect
+     * and rediscover remoted devices.
+     */
     async clearTryDiscoverDevices(): Promise<void> {
         await this.tryLogin();
+        // bjia56:
+        // there's some race condition with multi-tier device discovery that I haven't
+        // sorted out, but it appears to work fine if we run discovery twice
+        await this.discoverDevices(0);
         await this.discoverDevices(0);
     }
 
@@ -95,7 +143,8 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
         this.client = null;
 
         if (!this.settingsStorage.values.baseUrl || !this.settingsStorage.values.username || !this.settingsStorage.values.password) {
-            throw new Error("Initializing remote Scrypted login requires the base URL, username, and password");
+            this.console.log("Initializing remote Scrypted login requires the base URL, username, and password");
+            return;
         }
 
         const httpsAgent = new https.Agent({
@@ -130,13 +179,8 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
         const devices = <Device[]>[];
         for (const id in state) {
             const remoteDevice = this.client.systemManager.getDeviceById(id);
-            try {
-                // test access
-                remoteDevice.nativeId;
-            } catch {
-                this.console.log(`Cannot access remote device ${id}, ignoring`);
-                continue;
-            }
+            const remoteProviderDevice = this.client.systemManager.getDeviceById(remoteDevice.providerId);
+            const remoteProviderNativeId = remoteProviderDevice?.id == remoteDevice.id ? undefined : remoteProviderDevice?.id;
 
             const device = this.filtered(<Device>{
                 name: remoteDevice.name,
@@ -144,6 +188,7 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
                 interfaces: remoteDevice.interfaces,
                 info: remoteDevice.info,
                 nativeId: remoteDevice.id,
+                providerNativeId: remoteProviderNativeId,
             });
             if (!device) {
                 this.console.log(`Device ${remoteDevice.name} is not supported, ignoring`)
@@ -155,10 +200,27 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
             devices.push(device)
         }
 
-        await deviceManager.onDevicesChanged({
-            devices,
+        const providerDeviceMap = new Map<string, Device[]>();
+        devices.map(device => {
+            // group devices by parent provider id
+            if (!providerDeviceMap.has(device.providerNativeId)) {
+                providerDeviceMap.set(device.providerNativeId, [device]);
+            } else {
+                providerDeviceMap.get(device.providerNativeId).push(device);
+            }
+        })
+
+        await deviceManager.onDevicesChanged(<DeviceManifest>{
+            devices: providerDeviceMap.get(undefined), // first register the top level devices
         });
-        devices.map(device => this.setupProxies(device, this.devices.get(device.nativeId)))
+        for (let [providerNativeId, devices] of providerDeviceMap) {
+            await deviceManager.onDevicesChanged(<DeviceManifest>{
+                devices,
+                providerNativeId,
+            });
+        }
+
+        devices.map(device => this.setupProxies(device, this.devices.get(device.nativeId)));
         this.console.log(`Discovered ${devices.length} devices`);
     }
 
