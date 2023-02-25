@@ -1,4 +1,4 @@
-import { Device, DeviceProvider, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue} from '@scrypted/sdk';
+import { Device, DeviceProvider, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, Battery, VideoCamera, SettingValue, RequestMediaStreamOptions, MediaObject} from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { connectScryptedClient, ScryptedClientStatic } from '@scrypted/client';
@@ -38,12 +38,14 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
      * Returns the (potentially modified) device that is allowed, or null if the device cannot
      * be imported.
      */
-    allowlisted(device: Device): Device {
+    filtered(device: Device): Device {
         // only permit the following interfaces through
         const allowedInterfaces = [
             ScryptedInterface.VideoCamera,
             ScryptedInterface.Camera,
             ScryptedInterface.RTCSignalingChannel,
+            ScryptedInterface.Battery,
+            ScryptedInterface.MotionSensor,
         ];
         const intersection = allowedInterfaces.filter(i => device.interfaces.includes(i));
         if (intersection.length == 0) {
@@ -52,6 +54,36 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
         device.interfaces = intersection;
 
         return device;
+    }
+
+    setupProxies(device: Device, remoteDevice: ScryptedDevice) {
+        // set up event listeners for all the relevant interfaces
+        device.interfaces.map(iface => remoteDevice.listen(iface, (source, details, data) => {
+            if (!details.property) {
+                deviceManager.onDeviceEvent(device.nativeId, details.eventInterface, data);
+            } else {
+                deviceManager.getDeviceState(device.nativeId)[details.property] = data;
+            }
+        }));
+
+        // for certain interfaces with fixed state, transfer the initial values over
+        if (device.interfaces.indexOf(ScryptedInterface.Battery) != -1) {
+            deviceManager.getDeviceState(device.nativeId).batteryLevel = (<Battery>remoteDevice).batteryLevel;
+        }
+
+        // since the remote may be using rebroadcast, explicitly request the external
+        // address here
+        if (device.interfaces.indexOf(ScryptedInterface.VideoCamera) != -1) {
+            const remoteGetVideoStream = (<VideoCamera><any>remoteDevice).getVideoStream;
+            async function newGetVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
+                if (!options) {
+                    options = {};
+                }
+                (<any>options).route = "external";
+                return await remoteGetVideoStream(options);
+            }
+            (<VideoCamera><any>remoteDevice).getVideoStream = newGetVideoStream;
+        }
     }
 
     async clearTryDiscoverDevices(): Promise<void> {
@@ -106,7 +138,7 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
                 continue;
             }
 
-            const device = this.allowlisted(<Device>{
+            const device = this.filtered(<Device>{
                 name: remoteDevice.name,
                 type: remoteDevice.type,
                 interfaces: remoteDevice.interfaces,
@@ -126,6 +158,7 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
         await deviceManager.onDevicesChanged({
             devices,
         });
+        devices.map(device => this.setupProxies(device, this.devices.get(device.nativeId)))
         this.console.log(`Discovered ${devices.length} devices`);
     }
 

@@ -29,10 +29,10 @@
       ]
    },
    "dependencies": {
-      "@scrypted/client": "^1.1.37"
+      "@scrypted/client": "^1.1.38"
    },
    "devDependencies": {
-      "@scrypted/sdk": "^0.2.63",
+      "@scrypted/sdk": "^0.2.64",
       "@types/node": "^17.0.24"
    }
 }
