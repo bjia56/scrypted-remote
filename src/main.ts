@@ -1,13 +1,13 @@
-import { Device, DeviceProvider, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, Battery, VideoCamera, SettingValue, RequestMediaStreamOptions, MediaObject, DeviceManifest} from '@scrypted/sdk';
+import { Device, DeviceProvider, DeviceCreator, DeviceCreatorSettings, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, Battery, VideoCamera, SettingValue, RequestMediaStreamOptions, MediaObject, DeviceManifest} from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { connectScryptedClient, ScryptedClientStatic } from '@scrypted/client';
 import https from 'https';
-import { stringify } from 'querystring';
+import { v4 as uuidv4 } from 'uuid';
 
 const { deviceManager } = sdk;
 
-class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider, Settings {
+class ScryptedRemoteInstance extends ScryptedDeviceBase implements DeviceProvider, Settings {
     client: ScryptedClientStatic = null;
 
     devices = new Map<string, ScryptedDevice>();
@@ -29,8 +29,8 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
         },
     });
 
-    constructor() {
-        super();
+    constructor(nativeId: string) {
+        super(nativeId);
         this.clearTryDiscoverDevices();
     }
 
@@ -60,7 +60,9 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
             ScryptedInterface.RTCSignalingChannel,
             ScryptedInterface.Battery,
             ScryptedInterface.MotionSensor,
+            ScryptedInterface.AudioSensor,
             ScryptedInterface.DeviceProvider,
+            ScryptedInterface.ObjectDetector,
         ];
         const intersection = allowedInterfaces.filter(i => device.interfaces.includes(i));
         if (intersection.length == 0) {
@@ -182,13 +184,14 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
             const remoteProviderDevice = this.client.systemManager.getDeviceById(remoteDevice.providerId);
             const remoteProviderNativeId = remoteProviderDevice?.id == remoteDevice.id ? undefined : remoteProviderDevice?.id;
 
+            const nativeId = `${this.nativeId}:${remoteDevice.id}`;
             const device = this.filtered(<Device>{
                 name: remoteDevice.name,
                 type: remoteDevice.type,
                 interfaces: remoteDevice.interfaces,
                 info: remoteDevice.info,
-                nativeId: remoteDevice.id,
-                providerNativeId: remoteProviderNativeId,
+                nativeId: nativeId,
+                providerNativeId: remoteProviderNativeId ? `${this.nativeId}:${remoteProviderNativeId}` : this.nativeId,
             });
             if (!device) {
                 this.console.log(`Device ${remoteDevice.name} is not supported, ignoring`)
@@ -211,7 +214,8 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
         })
 
         await deviceManager.onDevicesChanged(<DeviceManifest>{
-            devices: providerDeviceMap.get(undefined), // first register the top level devices
+            devices: providerDeviceMap.get(this.nativeId), // first register the top level devices
+            providerNativeId: this.nativeId,
         });
         for (let [providerNativeId, devices] of providerDeviceMap) {
             await deviceManager.onDevicesChanged(<DeviceManifest>{
@@ -226,13 +230,80 @@ class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceProvider,
 
     async getDevice(nativeId: string): Promise<Device> {
         if (!this.devices.has(nativeId)) {
-            throw new Error(`${nativeId} does not exist`)
+            throw new Error(`${nativeId} does not exist`);
         }
         return <Device>this.devices.get(nativeId);
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {
         this.devices.delete(nativeId)
+    }
+}
+
+class ScryptedRemotePlugin extends ScryptedDeviceBase implements DeviceCreator, DeviceProvider {
+    remotes = new Map<string, ScryptedRemoteInstance>();
+
+    constructor() {
+        super();
+    }
+
+    async getDevice(nativeId: string): Promise<Device> {
+        if (!this.remotes.has(nativeId)) {
+            this.remotes.set(nativeId, new ScryptedRemoteInstance(nativeId));
+        }
+        return this.remotes.get(nativeId) as Device;
+    }
+
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
+        return;
+    }
+
+    async getCreateDeviceSettings(): Promise<Setting[]> {
+        return [
+            {
+                key: 'name',
+                title: 'Name',
+            },
+            {
+                key: 'baseUrl',
+                title: 'Base URL',
+                placeholder: 'https://localhost:10443',
+            },
+            {
+                key: 'username',
+                title: 'Username',
+            },
+            {
+                key: 'password',
+                title: 'Password',
+                type: 'password',
+            },
+        ];
+    }
+
+    async createDevice(settings: DeviceCreatorSettings): Promise<string> {
+        const name = settings.name?.toString();
+        const url = settings.baseUrl?.toString();
+        const username = settings.username?.toString();
+        const password = settings.password?.toString();
+
+        const nativeId = uuidv4();
+        await deviceManager.onDeviceDiscovered(<Device>{
+            nativeId,
+            name,
+            interfaces: [
+                ScryptedInterface.Settings,
+                ScryptedInterface.DeviceProvider
+            ],
+            type: ScryptedDeviceType.DeviceProvider,
+        });
+
+        const remote = await this.getDevice(nativeId) as ScryptedRemoteInstance;
+        remote.storage.setItem("baseUrl", url);
+        remote.storage.setItem("username", username);
+        remote.storage.setItem("password", password);
+        await remote.clearTryDiscoverDevices();
+        return nativeId;
     }
 }
 

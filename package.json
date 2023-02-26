@@ -22,14 +22,15 @@
    ],
    "scrypted": {
       "name": "Scrypted Remote Plugin",
-      "type": "DeviceProvider",
+      "type": "DeviceCreator",
       "interfaces": [
          "DeviceProvider",
-         "Settings"
+         "DeviceCreator"
       ]
    },
    "dependencies": {
-      "@scrypted/client": "^1.1.38"
+      "@scrypted/client": "^1.1.38",
+      "uuid": "^9.0.0"
    },
    "devDependencies": {
       "@scrypted/sdk": "^0.2.64",
